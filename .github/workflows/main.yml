@@ -5,13 +5,6 @@ name: Build Patched & Signed LK
 on:
   push:
     branches: [main]
-    paths:
-      - 'lk.bin'
-      - 'patches/**'
-      - 'scripts/**'
-      - '.github/workflows/build-lk.yml'
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       sign_mode:
@@ -19,9 +12,7 @@ on:
         required: true
         default: 'test'
         type: choice
-        options:
-          - test      # generate ephemeral RSA-2048 key in CI
-          - release   # use RSA key stored in repo secrets
+        options: [test, release]
 
 jobs:
   build:
@@ -29,46 +20,48 @@ jobs:
     runs-on: ubuntu-22.04
 
     env:
-      LK_IN:        lk.bin
-      LK_PATCHED:   out/lk_patched.bin
-      LK_SIGNED:    out/lk_signed.bin
-      KEY_PRIV:     keys/lk_rsa2048.pem
-      KEY_PUB:      keys/lk_rsa2048_pub.pem
-      SIGN_MODE:    ${{ github.event.inputs.sign_mode || 'test' }}
+      LK_IN:      lk.bin
+      LK_PATCHED: out/lk_patched.bin
+      LK_SIGNED:  out/lk_signed.bin
+      KEY_PRIV:   keys/lk_rsa2048.pem
+      KEY_PUB:    keys/lk_rsa2048_pub.pem
+      SIGN_MODE:  ${{ github.event.inputs.sign_mode || 'test' }}
 
     steps:
 
-      # ── 1. Checkout ──────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          lfs: true          # lk.bin likely tracked with Git LFS
+          lfs: true
 
-      # ── 2. Python + deps ─────────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Python deps
-        run: pip install -r scripts/requirements.txt
-
-      # ── 3. Verify lk.bin present and valid ───────────────────
+      # ── no external deps — stdlib only ─────────────────────
       - name: Validate lk.bin
         run: |
           python3 scripts/validate_lk.py lk.bin
           echo "LK_SHA256=$(sha256sum lk.bin | cut -d' ' -f1)" >> $GITHUB_ENV
 
-      # ── 4. Apply patches ─────────────────────────────────────
-      - name: Apply patches
+      # ── auto-find patch offsets (replaces Ghidra) ──────────
+      - name: Find patch offsets
         run: |
           mkdir -p out
-          python3 scripts/patch_lk.py \
-            --input  ${{ env.LK_IN }}     \
-            --output ${{ env.LK_PATCHED}} \
-            --patch-dir patches/
+          python3 scripts/find_offsets.py \
+            --input lk.bin \
+            --out   out/offsets.json
 
-      # ── 5a. Test signing — ephemeral key ─────────────────────
+      # ── apply patches ──────────────────────────────────────
+      - name: Patch lk.bin
+        run: |
+          python3 scripts/patch_lk.py \
+            --input   lk.bin           \
+            --output  ${{ env.LK_PATCHED }} \
+            --offsets out/offsets.json
+
+      # ── test key (ephemeral, CI only) ──────────────────────
       - name: Generate test key
         if: env.SIGN_MODE == 'test'
         run: |
@@ -82,13 +75,12 @@ jobs:
             -days 3650               \
             -subj '/CN=LK-TEST/O=CI/C=US' \
             -outform DER
-          echo "SIGN_MODE=test" >> $GITHUB_ENV
 
-      # ── 5b. Release signing — key from secrets ────────────────
+      # ── release key from secrets ───────────────────────────
       - name: Restore release key
         if: env.SIGN_MODE == 'release'
         env:
-          LK_SIGNING_KEY: ${{ secrets.LK_SIGNING_KEY }}
+          LK_SIGNING_KEY:  ${{ secrets.LK_SIGNING_KEY }}
           LK_SIGNING_CERT: ${{ secrets.LK_SIGNING_CERT }}
         run: |
           mkdir -p keys
@@ -98,56 +90,7 @@ jobs:
                       -pubout -out ${{ env.KEY_PUB }}
           chmod 600 ${{ env.KEY_PRIV }}
 
-      # ── 6. Sign ──────────────────────────────────────────────
-      - name: Sign lk_patched.bin
+      # ── sign ───────────────────────────────────────────────
+      - name: Sign
         run: |
-          python3 scripts/sign_lk.py     \
-            --input  ${{ env.LK_PATCHED }} \
-            --output ${{ env.LK_SIGNED }}  \
-            --key    ${{ env.KEY_PRIV }}   \
-            --cert   keys/cert.der
-
-      # ── 7. Sanity checks ─────────────────────────────────────
-      - name: Verify outputs
-        run: |
-          python3 scripts/verify_lk.py \
-            --original  ${{ env.LK_IN }}      \
-            --patched   ${{ env.LK_PATCHED }}  \
-            --signed    ${{ env.LK_SIGNED }}   \
-            --pubkey    ${{ env.KEY_PUB }}
-
-      # ── 8. Build summary ─────────────────────────────────────
-      - name: Write build summary
-        run: |
-          PATCHED_SHA=$(sha256sum ${{ env.LK_PATCHED }} | cut -d' ' -f1)
-          SIGNED_SHA=$(sha256sum  ${{ env.LK_SIGNED }}  | cut -d' ' -f1)
-          cat >> $GITHUB_STEP_SUMMARY << EOF
-          ## LK Build Summary
-          | File            | SHA-256 |
-          |-----------------|---------|
-          | lk.bin (orig)   | \`${{ env.LK_SHA256 }}\` |
-          | lk_patched.bin  | \`$PATCHED_SHA\` |
-          | lk_signed.bin   | \`$SIGNED_SHA\`  |
-
-          **Sign mode:** \`${{ env.SIGN_MODE }}\`
-          **Trigger:** \`${{ github.event_name }}\`
-          EOF
-
-      # ── 9. Upload artifacts ───────────────────────────────────
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: lk-${{ github.run_number }}-${{ env.SIGN_MODE }}
-          retention-days: 30
-          path: |
-            out/lk_patched.bin
-            out/lk_signed.bin
-            keys/lk_rsa2048_pub.pem
-            keys/cert.der
-
-      # ── 10. Wipe private key from runner ──────────────────────
-      - name: Wipe key material
-        if: always()
-        run: |
-          shred -u ${{ env.KEY_PRIV }} 2>/dev/null || true
-          rm -rf keys/
+          python
